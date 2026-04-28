@@ -1,0 +1,76 @@
+[
+  {
+    "id": 1,
+    "category": "Network - Port Conflict (Easy)",
+    "break_command": "sudo nohup python3 -m http.server 3000 > /dev/null 2>&1 &",
+    "cleanup_command": "sudo fuser -k 3000/tcp || true",
+    "description": "Port 3000 is occupied by a standard dummy process."
+  },
+  {
+    "id": 2,
+    "category": "Environment - Missing Package Manager (Easy)",
+    "break_command": "sudo apt-get remove -y npm || true",
+    "cleanup_command": "sudo apt-get update && sudo apt-get install -y npm || true",
+    "description": "NPM is uninstalled from the system, causing 'npm install' to fail."
+  },
+  {
+    "id": 3,
+    "category": "Application - Missing Peer Dependency (Easy)",
+    "break_command": "mkdir -p app && echo '{\"dependencies\": {\"react-dom\": \"18.2.0\"}}' > app/package.json",
+    "cleanup_command": "sudo rm -rf app",
+    "description": "A package is installed without its required peer dependency (React), causing build/start scripts to fail."
+  },
+  {
+    "id": 4,
+    "category": "Application - Malformed JSON Config (Easy)",
+    "break_command": "mkdir -p app && echo '{\"name\": \"app\", \"scripts\": {\"dev\": \"next dev\",}}' > app/package.json",
+    "cleanup_command": "sudo rm -rf app",
+    "description": "The package.json contains a syntax error (trailing comma), causing npm commands to fail immediately when parsing."
+  },
+  {
+    "id": 5,
+    "category": "Network - Zombie Process with Ignored Signals (Medium)",
+    "break_command": "cat << 'EOF' > /tmp/zombie.js\nprocess.on('SIGTERM', () => { console.log('Ignoring termination...'); });nsetInterval(() => {}, 1000);\nEOF\nsudo nohup node /tmp/zombie.js > /dev/null 2>&1 &",
+    "cleanup_command": "sudo pkill -9 -f /tmp/zombie.js || true && rm -f /tmp/zombie.js",
+    "description": "A Node process occupies resources but ignores standard SIGTERM kill signals, requiring a SIGKILL (-9)."
+  },
+  {
+    "id": 6,
+    "category": "Permissions - Root Ownership Lockout (Medium)",
+    "break_command": "mkdir -p app/node_modules && sudo chown root:root app/node_modules",
+    "cleanup_command": "sudo chown -R ubuntu:ubuntu app || true && sudo rm -rf app",
+    "description": "The node_modules directory is owned by root, causing 'npm install' to fail with EACCES permission denied errors."
+  },
+  {
+    "id": 7,
+    "category": "Network - IPTables Port Block (Medium)",
+    "break_command": "sudo iptables -A INPUT -p tcp --dport 3000 -j REJECT",
+    "cleanup_command": "sudo iptables -D INPUT -p tcp --dport 3000 -j REJECT || true",
+    "description": "The server's internal firewall (iptables) is configured to actively reject traffic on port 3000."
+  },
+  {
+    "id": 8,
+    "category": "Application - Read-Only Package.json (Hard)",
+    "break_command": "mkdir -p app && echo '{\"scripts\": {\"dev\": \"next dev\"}}' > app/package.json && sudo chattr +i app/package.json || true",
+    "cleanup_command": "sudo chattr -i app/package.json || true && sudo rm -rf app",
+    "description": "The package.json file is made immutable. NPM cannot update it, and Git cannot overwrite it."
+  },
+  {
+    "id": 9,
+    "category": "Environment - Path Hijacking (Hard)",
+    "break_command": "sudo mv /usr/bin/npm /usr/bin/npm-backup || true && echo 'echo \"npm is broken\" && exit 1' | sudo tee /usr/bin/npm > /dev/null && sudo chmod +x /usr/bin/npm",
+    "cleanup_command": "sudo rm -f /usr/bin/npm && sudo mv /usr/bin/npm-backup /usr/bin/npm || true",
+    "description": "NPM exists in the PATH, but the binary is replaced by a malicious/broken bash script."
+  },
+  {
+    "id": 10,
+    "category": "Environment - Max File Descriptors Reached (Hard)",
+    "break_command": "ulimit -n 10",
+    "cleanup_command": "ulimit -n 1024 || true",
+    "description": "The maximum number of open files is restricted to 10, causing NPM and Node to crash instantly during module resolution."
+  }
+
+]
+
+
+
