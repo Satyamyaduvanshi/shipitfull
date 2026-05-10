@@ -3,8 +3,16 @@ from app.agents.deployer import DeployerAgent
 from app.agents.diagnoser import DiagnoserAgent
 from app.db import db, connect_db
 
+
 class OrchestratorAgent:
-    def __init__(self, deployment_id, repo_url, ssh_details, socketio, model_name="groq/llama-3.3-70b-versatile"):
+    def __init__(
+        self,
+        deployment_id,
+        repo_url,
+        ssh_details,
+        socketio=None,
+        model_name="groq/llama-3.3-70b-versatile",
+    ):
         self.deployment_id = deployment_id
         self.repo_url = repo_url
         self.socketio = socketio
@@ -12,147 +20,331 @@ class OrchestratorAgent:
         self.diagnoser = DiagnoserAgent(model_name=model_name)
 
     def log(self, message, level="info"):
-        """Sends real-time logs to Frontend, saves to Neon DB, and prints to console."""
-        # 1. Terminal Output (Arch Console)
+        """
+        Send logs to:
+        1. Console
+        2. Database (Neon)
+        3. Socket.IO (real-time frontend)
+        """
+        # 1. Console
         print(f"[{level.upper()}] {message}")
 
-        # 2. Database Persistence (Neon DB)
-        connect_db()
+        # 2. Database
         try:
-            db.log.create(data={
-                'deployment_id': self.deployment_id,
-                'message': message,
-                'level': level
-            })
+            connect_db()
+            db.log.create(
+                data={
+                    "deployment_id": self.deployment_id,
+                    "message": message,
+                    "level": level,
+                }
+            )
         except Exception as e:
             print(f"⚠️ Failed to save log to DB: {e}")
 
-        # 3. Live Stream (SocketIO)
-        if self.socketio:
-            self.socketio.emit('log', {
-                'deployment_id': self.deployment_id,
-                'message': message,
-                'level': level,
-                'timestamp': time.time() * 1000 # Milliseconds for JS
-            })
+        # 3. Socket.IO
+        try:
+            if self.socketio:
+                self.socketio.emit(
+                    "log",
+                    {
+                        "deployment_id": self.deployment_id,
+                        "message": message,
+                        "level": level,
+                        "timestamp": int(time.time() * 1000),  # milliseconds
+                    },
+                )
+        except Exception as e:
+            print(f"⚠️ Failed to emit socket log: {e}")
 
     def run(self):
+        repo_name = "app"
+
         try:
             self.log("🚀 Orchestrator initiated Production Deployment Loop.")
-            
+
+            # ------------------------------------------------------------------
+            # 1. CONNECT TO SERVER
+            # ------------------------------------------------------------------
             if not self.deployer.connect():
-                self.log("❌ SSH Connection failed. Verify credentials and Node IP.", "error")
+                self.log(
+                    "❌ SSH Connection failed. Verify credentials and server IP.",
+                    "error",
+                )
                 return False
 
-            # 1. CLEANUP
-            self.log("🧹 Terminating existing Node processes to free resources...", "warning")
+            # ------------------------------------------------------------------
+            # 2. CLEANUP OLD PROCESSES
+            # ------------------------------------------------------------------
+            self.log(
+                "🧹 Terminating existing Node processes to free resources...",
+                "warning",
+            )
             self.deployer.execute("pkill -f node || true")
 
-            # 2. FETCH CODE
+            # ------------------------------------------------------------------
+            # 3. CLONE OR UPDATE REPOSITORY
+            # ------------------------------------------------------------------
             self.log(f"📦 Synchronizing repository: {self.repo_url}")
-            # Ensure we are in a clean directory
-            repo_name = "app"
-            clone_cmd = f"if [ ! -d '{repo_name}' ]; then git clone {self.repo_url} {repo_name}; else cd {repo_name} && git pull; fi"
-            
-            success, _ = self.execute_with_retry(clone_cmd, "Source Control Sync")
-            if not success: return False
 
-            # 3. STACK ANALYSIS
+            clone_cmd = f"""
+                if [ ! -d "{repo_name}" ]; then
+                    git clone {self.repo_url} {repo_name};
+                else
+                    cd {repo_name} && git pull;
+                fi
+            """
+
+            success, _ = self.execute_with_retry(
+                clone_cmd,
+                "Source Control Sync",
+            )
+            if not success:
+                return False
+
+            # ------------------------------------------------------------------
+            # 4. STACK ANALYSIS
+            # ------------------------------------------------------------------
             self.log("🧠 Agent analyzing project structure...", "ai")
-            files_str, _, _ = self.deployer.execute(f"ls {repo_name}")
-            pkg_content, _, _ = self.deployer.execute(f"cat {repo_name}/package.json")
-            stack = self.diagnoser.detect_stack(files_str.split('\n'), pkg_content)
+
+            _, files_output, _, files_code = self.deployer.execute_detailed(
+                f"ls -1 {repo_name}"
+            )
+
+            if files_code != 0:
+                self.log("❌ Failed to read repository contents.", "error")
+                return False
+
+            _, package_json, _, package_code = self.deployer.execute_detailed(
+                f"cat {repo_name}/package.json"
+            )
+
+            if package_code != 0:
+                self.log("❌ package.json not found. Unsupported project type.", "error")
+                return False
+
+            stack = self.diagnoser.detect_stack(
+                files_output.splitlines(),
+                package_json,
+            )
 
             if not stack:
-                self.log("❌ Unsupported project type. No package.json found.", "error")
+                self.log("❌ Could not detect project stack.", "error")
                 return False
-            
+
             self.log(f"🧠 AI identified {stack['type']} environment.", "ai")
 
-            # 4. DEPENDENCY INSTALL
-            self.log(f"🛠️ Executing {stack['type']} dependency installation...", "info")
-            success, _ = self.execute_with_retry(f"cd {repo_name} && {stack['install_cmd']}", "Package Install")
-            if not success: return False
+            # ------------------------------------------------------------------
+            # 5. INSTALL DEPENDENCIES
+            # ------------------------------------------------------------------
+            self.log(
+                f"🛠️ Executing {stack['type']} dependency installation...",
+                "info",
+            )
 
-            # 5. BUILD PHASE
-            if stack.get('build_cmd'):
-                self.log(f"🏗️ Building optimized production assets...", "info")
-                success, _ = self.execute_with_retry(f"cd {repo_name} && {stack['build_cmd']}", "Production Build")
-                if not success: return False
-
-            # 6. LAUNCH & SMART VERIFICATION
-            self.log(f"🚀 Launching server in background: {stack['start_cmd']}", "success")
-            start_cmd = f"cd {repo_name} && nohup {stack['start_cmd']} > production.log 2>&1 &"
-            self.deployer.execute(start_cmd)
-            
-            # Settle time
-            time.sleep(6)
-            
-            # 7. POST-LAUNCH VALIDATION
-            self.log("🔍 Running post-launch health checks...", "info")
-            is_running, _, _ = self.deployer.execute("ps aux | grep node | grep -v grep")
-            
-            if is_running:
-                self.log("✨ Deployment confirmed. Application is responsive on Port 3000.", "success")
-                return True
-            else:
-                self.log("⚠️ App failed to stay alive. Reading logs for diagnosis...", "warning")
-                # HEALING: Read the actual output of the failed app
-                _, production_log, _ = self.deployer.execute(f"cd {repo_name} && tail -n 25 production.log")
-                
-                self.log(f"🧠 AI analyzing production.log failure:\n{production_log}", "ai")
-                
-                diagnosis = self.diagnoser.diagnose(production_log)
-                
-                if diagnosis.get('fix_command'):
-                    self.log(f"🧠 AI Diagnosis: {diagnosis['cause']}", "ai")
-                    self.log(f"💻 AI Fix Execution: {diagnosis['fix_command']}", "command")
-                    
-                    self.deployer.execute(diagnosis['fix_command'])
-                    self.log("🔄 Retrying launch after fix...", "info")
-                    self.deployer.execute(start_cmd)
-                    
-                    time.sleep(4)
-                    final_check, _, _ = self.deployer.execute("ps aux | grep node | grep -v grep")
-                    if final_check:
-                        self.log("✅ AI Healing successful. App is now live.", "success")
-                        return True
-
-                self.log("❌ Deployment failed. Manual logs at production.log", "error")
+            success, _ = self.execute_with_retry(
+                f"cd {repo_name} && {stack['install_cmd']}",
+                "Package Install",
+            )
+            if not success:
                 return False
+
+            # ------------------------------------------------------------------
+            # 6. BUILD PROJECT (IF NEEDED)
+            # ------------------------------------------------------------------
+            build_cmd = stack.get("build_cmd")
+
+            if build_cmd:
+                self.log("🏗️ Building optimized production assets...", "info")
+
+                success, _ = self.execute_with_retry(
+                    f"cd {repo_name} && {build_cmd}",
+                    "Production Build",
+                )
+
+                if not success:
+                    return False
+
+            # ------------------------------------------------------------------
+            # 7. START APPLICATION
+            # ------------------------------------------------------------------
+            start_cmd = stack["start_cmd"]
+
+            self.log(
+                f"🚀 Launching server in background: {start_cmd}",
+                "success",
+            )
+
+            launch_cmd = (
+                f"cd {repo_name} && "
+                f"nohup {start_cmd} > production.log 2>&1 &"
+            )
+
+            self.deployer.execute(launch_cmd)
+
+            # Allow process to initialize
+            time.sleep(6)
+
+            # ------------------------------------------------------------------
+            # 8. HEALTH CHECK
+            # ------------------------------------------------------------------
+            self.log("🔍 Running post-launch health checks...", "info")
+
+            _, process_output, _, _ = self.deployer.execute_detailed(
+                "ps aux | grep node | grep -v grep"
+            )
+
+            if process_output.strip():
+                self.log(
+                    "✨ Deployment confirmed. Application is running successfully.",
+                    "success",
+                )
+                return True
+
+            # ------------------------------------------------------------------
+            # 9. APP CRASHED -> READ LOGS
+            # ------------------------------------------------------------------
+            self.log(
+                "⚠️ Application failed to stay alive. Reading production logs...",
+                "warning",
+            )
+
+            _, production_log, _, _ = self.deployer.execute_detailed(
+                f"cd {repo_name} && tail -n 25 production.log"
+            )
+
+            self.log(
+                f"🧠 AI analyzing production.log failure:\n{production_log}",
+                "ai",
+            )
+
+            diagnosis = self.diagnoser.diagnose(production_log)
+
+            fix_command = diagnosis.get("fix_command")
+
+            if fix_command:
+                self.log(
+                    f"🧠 AI Diagnosis: {diagnosis.get('cause', 'Unknown issue')}",
+                    "ai",
+                )
+
+                self.log(
+                    f"💻 AI Fix Execution: {fix_command}",
+                    "command",
+                )
+
+                # Apply fix
+                _, fix_out, fix_err, fix_code = (
+                    self.deployer.execute_detailed(fix_command)
+                )
+
+                if fix_code != 0:
+                    self.log(
+                        f"❌ AI-generated fix failed:\n{fix_err or fix_out}",
+                        "error",
+                    )
+                    return False
+
+                # Retry launch
+                self.log("🔄 Retrying launch after fix...", "info")
+                self.deployer.execute(launch_cmd)
+
+                time.sleep(4)
+
+                _, final_output, _, _ = self.deployer.execute_detailed(
+                    "ps aux | grep node | grep -v grep"
+                )
+
+                if final_output.strip():
+                    self.log(
+                        "✅ AI healing successful. Application is now live.",
+                        "success",
+                    )
+                    return True
+
+            # ------------------------------------------------------------------
+            # 10. FINAL FAILURE
+            # ------------------------------------------------------------------
+            self.log(
+                "❌ Deployment failed. Check production.log for manual inspection.",
+                "error",
+            )
+            return False
 
         except Exception as e:
             self.log(f"🔥 Critical Orchestrator Exception: {str(e)}", "error")
             return False
+
         finally:
             self.cleanup()
 
     def execute_with_retry(self, command, label):
-        """Standard execution with one-shot AI self-healing."""
+        """
+        Execute a command once.
+        If it fails, ask AI for a fix and retry the original command.
+        Returns:
+            (success: bool, error_message: str)
+        """
         self.log(f"💻 Executing: {command}", "command")
-        _, out, err, code = self.deployer.execute_detailed(command)
-        
-        if code == 0: 
+
+        _, stdout, stderr, exit_code = self.deployer.execute_detailed(command)
+
+        # Success
+        if exit_code == 0:
             return True, ""
-        
-        self.log(f"⚠️ {label} failed (Exit Code {code}). Attempting AI recovery...", "warning")
-        diagnosis = self.diagnoser.diagnose(err if err else out)
-        
-        if diagnosis.get('fix_command'):
-            self.log(f"🧠 AI identified cause: {diagnosis['cause']}", "ai")
-            self.log(f"💻 AI applying fix: {diagnosis['fix_command']}", "command")
-            
-            # Apply fix
-            _, f_out, f_err, f_code = self.deployer.execute_detailed(diagnosis['fix_command'])
-            
-            if f_code == 0:
-                self.log("✅ Fix successful. Retrying original operation...", "success")
-                _, r_out, r_err, r_code = self.deployer.execute_detailed(command)
-                return r_code == 0, r_err
-        
-        return False, err
+
+        error_text = stderr or stdout
+
+        self.log(
+            f"⚠️ {label} failed (Exit Code {exit_code}). Attempting AI recovery...",
+            "warning",
+        )
+
+        diagnosis = self.diagnoser.diagnose(error_text)
+        fix_command = diagnosis.get("fix_command")
+
+        if not fix_command:
+            self.log("❌ AI could not generate a fix.", "error")
+            return False, error_text
+
+        self.log(
+            f"🧠 AI identified cause: {diagnosis.get('cause', 'Unknown issue')}",
+            "ai",
+        )
+
+        self.log(
+            f"💻 AI applying fix: {fix_command}",
+            "command",
+        )
+
+        # Apply fix
+        _, fix_stdout, fix_stderr, fix_exit_code = (
+            self.deployer.execute_detailed(fix_command)
+        )
+
+        if fix_exit_code != 0:
+            self.log(
+                f"❌ Fix command failed:\n{fix_stderr or fix_stdout}",
+                "error",
+            )
+            return False, error_text
+
+        self.log("✅ Fix successful. Retrying original operation...", "success")
+
+        # Retry original command
+        _, retry_stdout, retry_stderr, retry_exit_code = (
+            self.deployer.execute_detailed(command)
+        )
+
+        if retry_exit_code == 0:
+            return True, ""
+
+        return False, retry_stderr or retry_stdout
 
     def cleanup(self):
-        """Gracefully close remote connections."""
-        if self.deployer:
-            self.deployer.close()
+        """Gracefully close SSH connection."""
+        try:
+            if self.deployer:
+                self.deployer.close()
+        except Exception:
+            pass
